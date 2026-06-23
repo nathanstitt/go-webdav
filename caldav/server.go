@@ -580,6 +580,9 @@ func (b *backend) propFindCalendar(ctx context.Context, propfind *internal.PropF
 			Size: cal.MaxResourceSize,
 		})
 	}
+	if cal.CTag != "" {
+		props[internal.GetCTagName] = internal.PropFindValue(&internal.GetCTag{CTag: cal.CTag})
+	}
 
 	// TODO: CALDAV:min-date-time, CALDAV:max-date-time, CALDAV:max-instances, CALDAV:max-attendees-per-instance
 
