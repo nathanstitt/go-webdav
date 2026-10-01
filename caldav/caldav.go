@@ -4,6 +4,7 @@
 package caldav
 
 import (
+	"context"
 	"fmt"
 	"time"
 
@@ -77,6 +78,26 @@ type Calendar struct {
 	// CTag, when set, is reported as the CalendarServer getctag property: an
 	// opaque token that must change whenever the calendar's contents change.
 	CTag string
+}
+
+// CalendarUpdate carries the properties a PROPPATCH asks to change on a
+// calendar. A nil field was not mentioned in the request and must be left
+// alone; a non-nil field holds the new value, empty when the request removed
+// the property.
+type CalendarUpdate struct {
+	Name  *string
+	Color *string
+}
+
+// CalendarUpdater is implemented by backends that accept PROPPATCH on a
+// calendar. A backend that does not implement it keeps the default behavior:
+// every property is refused, reported per-property inside the multistatus.
+type CalendarUpdater interface {
+	// UpdateCalendar applies update to the calendar at path. Only the
+	// non-nil fields are being set. Returning an error fails the PROPPATCH;
+	// the properties it carries are then reported as failed, and the rest of
+	// the request's properties as unchanged, per RFC 4918.
+	UpdateCalendar(ctx context.Context, path string, update CalendarUpdate) error
 }
 
 type CalendarCompRequest struct {

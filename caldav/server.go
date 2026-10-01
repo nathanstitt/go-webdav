@@ -675,35 +675,126 @@ func (b *backend) propFindAllCalendarObjects(ctx context.Context, propfind *inte
 }
 
 func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*internal.Response, error) {
-	homeSetPath, err := b.Backend.CalendarHomeSetPath(r.Context())
-	if err != nil {
-		return nil, err
-	}
-
 	resp := internal.NewOKResponse(r.URL.Path)
 
-	// Properties cannot be written yet, but refusing per-property inside a 207
-	// rather than failing the request keeps clients that PROPPATCH display
-	// metadata while adopting a calendar (macOS Calendar) from dropping it.
-	status := http.StatusMethodNotAllowed
-	if r.URL.Path == homeSetPath {
-		// TODO: support PROPPATCH for calendars
-		status = http.StatusNotImplemented
+	// Only a calendar carries writable properties. Use the path's resource
+	// type rather than comparing against CalendarHomeSetPath: the home set is
+	// advertised with a trailing slash, so a client that normalizes it away
+	// would otherwise be answered as if it had addressed some other resource.
+	if b.resourceTypeAtPath(r.URL.Path) != resourceTypeCalendar {
+		return refuseAll(resp, update, http.StatusMethodNotAllowed)
+	}
+
+	updater, ok := b.Backend.(CalendarUpdater)
+	if !ok {
+		// Properties cannot be written, but refusing per-property inside a 207
+		// rather than failing the request keeps clients that PROPPATCH display
+		// metadata while adopting a calendar (macOS Calendar) from dropping it.
+		return refuseAll(resp, update, http.StatusNotImplemented)
+	}
+
+	var (
+		calUpdate CalendarUpdate
+		accepted  []xml.Name
+		refused   []xml.Name
+	)
+
+	// A removed property resets to its zero value; a set one carries the new
+	// text. Anything the backend has no field for is refused, not ignored, so
+	// a client is never told a write succeeded when nothing was stored.
+	collect := func(raw []internal.RawXMLValue, removing bool) error {
+		for i := range raw {
+			name, ok := raw[i].XMLName()
+			if !ok {
+				continue
+			}
+			value := ""
+			if !removing {
+				var text struct {
+					Chardata string `xml:",chardata"`
+				}
+				if err := raw[i].Decode(&text); err != nil {
+					return err
+				}
+				value = text.Chardata
+			}
+			switch name {
+			case internal.DisplayNameName:
+				calUpdate.Name = &value
+				accepted = append(accepted, name)
+			case calendarColorName:
+				calUpdate.Color = &value
+				accepted = append(accepted, name)
+			default:
+				refused = append(refused, name)
+			}
+		}
+		return nil
 	}
 
 	for _, prop := range update.Remove {
-		emptyVal := internal.NewRawXMLElement(prop.Prop.XMLName, nil, nil)
-		if err := resp.EncodeProp(status, emptyVal); err != nil {
+		if err := collect(prop.Prop.Raw, true); err != nil {
 			return nil, err
 		}
 	}
 	for _, prop := range update.Set {
-		emptyVal := internal.NewRawXMLElement(prop.Prop.XMLName, nil, nil)
-		if err := resp.EncodeProp(status, emptyVal); err != nil {
+		if err := collect(prop.Prop.Raw, false); err != nil {
 			return nil, err
 		}
 	}
 
+	status := http.StatusOK
+	if len(accepted) > 0 {
+		if err := updater.UpdateCalendar(r.Context(), r.URL.Path, calUpdate); err != nil {
+			// RFC 4918: when one property fails the others must report
+			// 424 Failed Dependency rather than claiming success.
+			if httpErr, ok := err.(*internal.HTTPError); ok {
+				status = httpErr.Code
+			} else {
+				status = http.StatusForbidden
+			}
+		}
+	}
+
+	for _, name := range accepted {
+		if err := resp.EncodeProp(status, internal.NewRawXMLElement(name, nil, nil)); err != nil {
+			return nil, err
+		}
+	}
+	for _, name := range refused {
+		if err := resp.EncodeProp(http.StatusForbidden, internal.NewRawXMLElement(name, nil, nil)); err != nil {
+			return nil, err
+		}
+	}
+
+	return resp, nil
+}
+
+// refuseAll reports every property in the update with status, inside an
+// otherwise successful multistatus.
+func refuseAll(resp *internal.Response, update *internal.PropertyUpdate, status int) (*internal.Response, error) {
+	encode := func(raw []internal.RawXMLValue) error {
+		for i := range raw {
+			name, ok := raw[i].XMLName()
+			if !ok {
+				continue
+			}
+			if err := resp.EncodeProp(status, internal.NewRawXMLElement(name, nil, nil)); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	for _, prop := range update.Remove {
+		if err := encode(prop.Prop.Raw); err != nil {
+			return nil, err
+		}
+	}
+	for _, prop := range update.Set {
+		if err := encode(prop.Prop.Raw); err != nil {
+			return nil, err
+		}
+	}
 	return resp, nil
 }
 

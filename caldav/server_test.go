@@ -707,3 +707,132 @@ func (t *testBackend) ListCalendarObjects(ctx context.Context, path string, req 
 func (t *testBackend) QueryCalendarObjects(ctx context.Context, path string, query *CalendarQuery) ([]CalendarObject, error) {
 	return nil, nil
 }
+
+// updatableBackend records what UpdateCalendar received so a test can assert
+// the PROPPATCH was parsed into the right CalendarUpdate.
+type updatableBackend struct {
+	*testBackend
+	got CalendarUpdate
+	err error
+}
+
+func (b *updatableBackend) UpdateCalendar(ctx context.Context, path string, update CalendarUpdate) error {
+	b.got = update
+	return b.err
+}
+
+var propPatchCalendarRequest = `
+<?xml version="1.0" encoding="UTF-8"?>
+<D:propertyupdate xmlns:D="DAV:" xmlns:A="http://apple.com/ns/ical/">
+  <D:set>
+    <D:prop>
+      <D:displayname>Renamed</D:displayname>
+      <A:calendar-color>#FF9500FF</A:calendar-color>
+      <A:calendar-order>3</A:calendar-order>
+    </D:prop>
+  </D:set>
+</D:propertyupdate>`
+
+func propPatch(t *testing.T, backend Backend, path string) *internal.MultiStatus {
+	t.Helper()
+	req := httptest.NewRequest("PROPPATCH", path, nil)
+	req.Body = io.NopCloser(strings.NewReader(propPatchCalendarRequest))
+	req.Header.Set("Content-Type", "application/xml")
+	w := httptest.NewRecorder()
+	(&Handler{Backend: backend}).ServeHTTP(w, req)
+
+	resp := w.Result()
+	if resp.StatusCode != 207 {
+		t.Fatalf("got status %d, want 207", resp.StatusCode)
+	}
+	var ms internal.MultiStatus
+	if err := xml.NewDecoder(resp.Body).Decode(&ms); err != nil {
+		t.Fatalf("decoding multistatus: %s", err)
+	}
+	return &ms
+}
+
+// statusOf maps each property name in the multistatus to its reported status.
+func statusOf(t *testing.T, ms *internal.MultiStatus) map[string]int {
+	t.Helper()
+	out := map[string]int{}
+	for _, r := range ms.Responses {
+		for _, ps := range r.PropStats {
+			for i := range ps.Prop.Raw {
+				if name, ok := ps.Prop.Raw[i].XMLName(); ok {
+					out[name.Local] = ps.Status.Code
+				}
+			}
+		}
+	}
+	return out
+}
+
+// A backend that cannot write properties must still answer in protocol: a bare
+// 501 for the whole request makes macOS Calendar drop the calendar it is
+// adopting.
+func TestPropPatchCalendarUnsupported(t *testing.T) {
+	cal := Calendar{Path: "/user/calendars/cal", Name: "Test"}
+	ms := propPatch(t, &testBackend{calendars: []Calendar{cal}}, cal.Path)
+
+	for name, code := range statusOf(t, ms) {
+		if code != 501 {
+			t.Errorf("%s: got %d, want 501", name, code)
+		}
+	}
+}
+
+func TestPropPatchCalendar(t *testing.T) {
+	cal := Calendar{Path: "/user/calendars/cal", Name: "Test"}
+	b := &updatableBackend{testBackend: &testBackend{calendars: []Calendar{cal}}}
+	ms := propPatch(t, b, cal.Path)
+
+	if b.got.Name == nil || *b.got.Name != "Renamed" {
+		t.Errorf("Name = %v, want %q", b.got.Name, "Renamed")
+	}
+	if b.got.Color == nil || *b.got.Color != "#FF9500FF" {
+		t.Errorf("Color = %v, want %q", b.got.Color, "#FF9500FF")
+	}
+
+	got := statusOf(t, ms)
+	if got["displayname"] != 200 {
+		t.Errorf("displayname = %d, want 200", got["displayname"])
+	}
+	if got["calendar-color"] != 200 {
+		t.Errorf("calendar-color = %d, want 200", got["calendar-color"])
+	}
+	// Nothing stores calendar-order, so it must be refused rather than
+	// silently reported as written.
+	if got["calendar-order"] != 403 {
+		t.Errorf("calendar-order = %d, want 403", got["calendar-order"])
+	}
+}
+
+// A PROPPATCH addressed anywhere but a calendar is refused wholesale.
+func TestPropPatchNonCalendar(t *testing.T) {
+	b := &updatableBackend{testBackend: &testBackend{}}
+	ms := propPatch(t, b, "/user/calendars/")
+
+	for name, code := range statusOf(t, ms) {
+		if code != 405 {
+			t.Errorf("%s: got %d, want 405", name, code)
+		}
+	}
+	if b.got.Name != nil {
+		t.Error("UpdateCalendar was called for a non-calendar path")
+	}
+}
+
+// The home set is advertised with a trailing slash; a client that normalizes
+// it away must still be answered as addressing that calendar.
+func TestPropPatchCalendarTrailingSlash(t *testing.T) {
+	for _, path := range []string{"/user/calendars/cal", "/user/calendars/cal/"} {
+		b := &updatableBackend{testBackend: &testBackend{
+			calendars: []Calendar{{Path: "/user/calendars/cal", Name: "Test"}},
+		}}
+		ms := propPatch(t, b, path)
+		if got := statusOf(t, ms)["displayname"]; got != 200 {
+			t.Errorf("%s: displayname = %d, want 200", path, got)
+		}
+	}
+}
